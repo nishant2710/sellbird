@@ -2,9 +2,10 @@
 
 Runs on the operator's Claude subscription (Claude Code headless, the
 default) or, when ``brain.provider: codex`` is configured, their ChatGPT
-subscription through an isolated Codex runtime (see sellbird/codex.py). The
-provider is fixed per Brain; a failing provider never falls back to the
-other one.
+subscription through an isolated Codex runtime (see sellbird/codex.py), or
+with ``brain.provider: openrouter`` any OpenAI-compatible chat endpoint such as
+OpenRouter's free models (see sellbird/openrouter.py). The provider is fixed per
+Brain; a failing provider never falls back to another one.
 """
 
 import asyncio
@@ -39,7 +40,7 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "openrouter": "OpenRouter"}
 
 # Settings key holding the brain's last health transition, for `sellbird
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -50,6 +51,8 @@ BRAIN_STATUS_KEY = "brain_status"
 # CLI version, model choice, an unsafe Codex config layer). After one, the
 # Brain stops starting runtimes until something changes.
 _PERSISTENT_CODEX_KINDS = {"setup", "auth", "isolation"}
+# The same for OpenRouter: a missing key/model, a refused key, a wrong URL.
+_PERSISTENT_OPENROUTER_KINDS = {"setup", "auth"}
 # Re-check a paused provider at least this often even if nothing changed
 # on disk (e.g. a managed config layer was fixed).
 PROVIDER_RECHECK_SECONDS = 1800
@@ -88,6 +91,7 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
+        self.openrouter = None
         # Whether the last think_json got no reply at all (an outage, logout,
         # rate limit or timeout), as opposed to a reply that wasn't valid
         # JSON. Callers that count model failures must not count outages.
@@ -105,6 +109,13 @@ class Brain:
                 model=self.model, reasoning_effort=self.config.reasoning_effort
             )
             self.quota = CodexQuotaClient(self.codex)
+        elif self.provider == "openrouter":
+            from sellbird.openrouter import OpenRouterClient, OpenRouterQuotaClient
+            self.openrouter = OpenRouterClient(
+                model=self.model, base_url=self.config.base_url,
+                api_key_env=self.config.api_key_env,
+            )
+            self.quota = OpenRouterQuotaClient()
         else:
             # Lazy import avoids a cycle (quota -> usage -> state).
             from sellbird.integrations.quota import QuotaClient
@@ -137,6 +148,8 @@ class Brain:
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
+        if self.provider == "openrouter":
+            return await self._openrouter_preflight()
         if self.provider != "codex":
             return await self._claude_preflight()
         from sellbird.codex import CodexError
@@ -193,9 +206,36 @@ class Brain:
             await self._mark_available()
         return ""
 
+    async def _openrouter_preflight(self) -> str:
+        """OpenRouter: key and model set, endpoint answers ``GET /models``.
+        No prompt is sent. Paused until the key/URL/model change or
+        PROVIDER_RECHECK_SECONDS pass, like Codex."""
+        from sellbird.openrouter import OpenRouterError
+
+        await self._expire_usage_pause()
+        if self.unavailable:
+            unchanged = self.openrouter.fingerprint() == self._unavailable_fingerprint
+            recent = time.monotonic() - self._unavailable_at < PROVIDER_RECHECK_SECONDS
+            if unchanged and recent:
+                return self.unavailable
+        try:
+            await self.openrouter.preflight()
+        except OpenRouterError as e:
+            if e.kind in _PERSISTENT_OPENROUTER_KINDS:
+                await self._mark_unavailable(e)
+                return self.unavailable
+            return str(e)
+        except Exception as e:
+            return f"OpenRouter preflight failed unexpectedly ({type(e).__name__})."
+        if self.unavailable:
+            await self._mark_available()
+        return ""
+
     def _fingerprint(self):
         if self.provider == "codex":
             return self.codex.fingerprint()
+        if self.provider == "openrouter":
+            return self.openrouter.fingerprint()
         from sellbird.claude_runtime import fingerprint
         return fingerprint()
 
@@ -264,6 +304,11 @@ class Brain:
         """
         if self.provider == "codex":
             return await self._think_codex(
+                prompt, session_id=session_id, timeout=timeout,
+                max_retries=max_retries, agent=agent, task=task,
+            )
+        if self.provider == "openrouter":
+            return await self._think_openrouter(
                 prompt, session_id=session_id, timeout=timeout,
                 max_retries=max_retries, agent=agent, task=task,
             )
@@ -498,6 +543,83 @@ class Brain:
             provider="codex",
             **result.usage,
         )
+
+    async def _think_openrouter(
+        self,
+        prompt: str,
+        session_id: str | None,
+        timeout: float,
+        max_retries: int,
+        agent: str,
+        task: str,
+    ) -> str:
+        """One chat completion per attempt (see sellbird/openrouter.py)."""
+        from sellbird.openrouter import OpenRouterError
+
+        await self._expire_usage_pause()
+        paused = self.paused_reason
+        if paused:
+            unchanged = self.openrouter.fingerprint() == self._unavailable_fingerprint
+            if not self.unavailable or unchanged:
+                logger.debug(f"OpenRouter call skipped: {paused}")
+                return ""
+            # The key, URL or model changed since the pause: try again.
+            await self._mark_available()
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    f"Retrying OpenRouter call in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1})..."
+                )
+                await asyncio.sleep(delay)
+            try:
+                result = await self.openrouter.run(prompt, timeout=timeout)
+            except OpenRouterError as e:
+                last_error = str(e)
+                if e.retryable:
+                    logger.warning(f"OpenRouter call failed: {e}")
+                    continue
+                logger.error(f"OpenRouter call failed: {e}")
+                if e.kind in _PERSISTENT_OPENROUTER_KINDS:
+                    await self._mark_unavailable(e)
+                elif e.kind == "usage_limit":
+                    await self._start_usage_pause()
+                return ""
+            except Exception as e:
+                # Log only the type: messages could carry call details.
+                logger.error(f"OpenRouter call failed unexpectedly ({type(e).__name__}).")
+                return ""
+
+            try:
+                await self.state.increment_usage(provider="openrouter")
+            except Exception as e:
+                logger.warning(f"Failed to record usage counter: {e}")
+            try:
+                label = session_id or ""
+                if not agent and label.startswith("sellbird-"):
+                    agent = label[len("sellbird-"):].split("-")[0]
+                await self.state.record_usage_event(
+                    agent=agent,
+                    task=task or label,
+                    session_id=result.request_id,
+                    model=result.model,
+                    duration_ms=result.duration_ms,
+                    num_turns=1,
+                    source="openai_chat",
+                    provider="openrouter",
+                    **result.usage,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record usage event: {e}")
+            return result.text
+
+        logger.error(
+            f"OpenRouter call failed after {max_retries + 1} attempts. "
+            f"Last error: {last_error[:200]}"
+        )
+        return ""
 
     @staticmethod
     def _parse_result_payload(raw: str) -> tuple[str, dict | None]:

@@ -154,6 +154,7 @@ Links to `github.com/ethanplusai/harvey` keep working: GitHub redirects them her
 | [The dashboard and the data](docs/dashboard.md) | Every screen, how sign-in works, and how the data is stored |
 | [Configuration and commands](docs/configuration.md) | `.env`, `sellbird.yaml` and every command |
 | [Using a ChatGPT plan (Codex)](docs/codex.md) | Running on Codex instead of Claude |
+| [Using OpenRouter](docs/openrouter.md) | Running on OpenRouter (free models too) or any OpenAI-compatible gateway |
 | [Legal and deliverability](docs/deliverability.md) | The rules you're sending under, and warmup |
 | [Microsoft 365](docs/microsoft365.md) · [Precleared](docs/precleared.md) | Provider setup guides |
 | [Docker](docs/docker.md) · [Troubleshooting](docs/troubleshooting.md) · [Roadmap](docs/roadmap.md) | Running, fixing and what's next |

@@ -603,7 +603,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "openrouter")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -615,14 +615,19 @@ class BrainConfig(BaseModel):
     """Which subscription Sellbird thinks with.
 
     ``claude`` (default) runs Claude Code headless on your Claude plan.
-    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
-    fallback between them, and an explicit ``model`` only affects Sellbird —
-    your own Claude Code / Codex settings are never read or changed.
+    ``codex`` runs Codex on your ChatGPT plan. ``openrouter`` calls any
+    OpenAI-compatible chat endpoint (OpenRouter, free ``:free`` models, or a
+    gateway in front of it) with the key in the ``api_key_env`` variable.
+    There is never an automatic fallback between them, and an explicit
+    ``model`` only affects Sellbird — your own Claude Code / Codex settings
+    are never read or changed.
     """
 
     provider: str = "claude"
-    model: str = ""  # empty = the provider's own default
+    model: str = ""  # empty = the provider's own default (required for openrouter)
     reasoning_effort: str = ""  # codex only; empty = model default
+    base_url: str = "https://openrouter.ai/api/v1"  # openrouter only
+    api_key_env: str = "OPENROUTER_API_KEY"  # openrouter only: env var holding the key
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -641,6 +646,22 @@ class BrainConfig(BaseModel):
         v = str(v or "").strip()
         if v and not _MODEL_NAME_RE.match(v):
             raise ValueError(f"'{v}' is not a valid model name.")
+        return v
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _valid_base_url(cls, v) -> str:
+        v = str(v or "https://openrouter.ai/api/v1").strip().rstrip("/")
+        if not re.match(r"^https?://[^\s/]+(/\S*)?$", v):
+            raise ValueError(f"'{v}' is not a valid http(s) base URL.")
+        return v
+
+    @field_validator("api_key_env", mode="before")
+    @classmethod
+    def _valid_api_key_env(cls, v) -> str:
+        v = str(v or "OPENROUTER_API_KEY").strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$", v):
+            raise ValueError(f"'{v}' is not a valid environment variable name.")
         return v
 
     @field_validator("reasoning_effort", mode="before")

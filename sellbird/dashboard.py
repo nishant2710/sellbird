@@ -2176,7 +2176,8 @@ async def get_today():
         # Ordered by how much it blocks Sellbird from doing anything at all.
         brain = await _brain_status()
         if brain.get("status") == "paused":
-            who = "Codex" if brain.get("provider") == "codex" else "Sellbird's model"
+            who = {"codex": "Codex", "openrouter": "OpenRouter"}.get(
+                brain.get("provider"), "Sellbird's model")
             items.append({
                 "key": "brain-paused", "tone": "bad",
                 "title": f"{who} is paused, so Sellbird is waiting",
